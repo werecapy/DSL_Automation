@@ -1,0 +1,270 @@
+"""
+Parse raw calendar entries like:
+    Nova Avon IDES 333 "Revit for Designers" | REAL TIME 12:40pm-2:00pm
+into structured columns, flag anything incomplete or suspicious, and write
+calendar_clean.xlsx. Reads calendar_raw.xlsx (from the pull scripts).
+ 
+Sheets written:
+    Tracker    - your tracking-sheet headings + Notes + Review Flag / Review Reason
+    Clean      - every parsed field, for troubleshooting
+    Raw        - the untouched export
+    Duplicates - rows removed as duplicates (only if any were found)
+ 
+Setup:  pip install pandas openpyxl
+"""
+ 
+import re
+import sys
+from collections import Counter
+from datetime import datetime
+ 
+import pandas as pd
+from openpyxl.styles import PatternFill
+ 
+# ----------------------------- SETTINGS ------------------------------------
+INPUT_FILE = "calendar_raw.xlsx"
+OUTPUT_FILE = "calendar_clean.xlsx"
+ 
+# Department code -> College/Dept name. Fill in the ones you use.
+# Codes missing from this table are flagged so you know to add them.
+DEPT_LOOKUP = {
+    "LIB": "Library",  # example only: replace with your real names
+    "UE": "Undergraduate Education",
+    "CAL": "College of Arts and Letters",
+    "x":"Public Events",
+    "CANR":"College of Agriculture & Natural Rescource",
+    "SocS": "College of Socical Science"
+    "BUS":"Buisness/Entrepenuership(? not sure whether to include both)"
+    "ESHP":"Entrepreneurship"
+
+
+}
+ 
+REQUIRED_INPUT_COLUMNS = ["Subject", "Start", "End"]
+# ---------------------------------------------------------------------------
+ 
+# Each piece is parsed independently so partly-formatted entries still yield what they can.
+COURSE_RE = re.compile(r"\b([A-Z]{2,5})\s?(\d{3}[A-Z]?)\b")
+TITLE_RE = re.compile(r'["\u201c\u201d](.+?)["\u201c\u201d]')
+MODE_RE = re.compile(r"\|\s*(.+?)\s*(?=\d{1,2}(?::\d{2})?\s*(?:[ap]m)?\s*[-\u2013]|$)", re.I)
+TIME_RANGE_RE = re.compile(
+    r"(\d{1,2}(?::\d{2})?)\s*([ap]m)?\s*[-\u2013]\s*(\d{1,2}(?::\d{2})?)\s*([ap]m)", re.I
+)
+ 
+ 
+def to_time(text, meridiem):
+    """'12:40' + 'pm' -> datetime.time"""
+    fmt = "%I:%M%p" if ":" in text else "%I%p"
+    return datetime.strptime(f"{text}{meridiem}".lower(), fmt).time()
+ 
+ 
+def parse_subject(subject):
+    """Return (fields dict, list of problems found while parsing)."""
+    out = {"Instructor": None, "Course_Prefix": None, "Course_Number": None, "Course": None,
+           "Course_Title": None, "Session_Mode": None, "Class_Start": None, "Class_End": None}
+    problems = []
+ 
+    s = "" if pd.isna(subject) else str(subject).strip()
+    if not s:
+        return out, ["Empty subject"]
+ 
+    try:
+        m = COURSE_RE.search(s)
+        if m:
+            out["Course_Prefix"], out["Course_Number"] = m.group(1), m.group(2)
+            out["Course"] = f"{m.group(1)} {m.group(2)}"
+            out["Instructor"] = s[: m.start()].strip() or None  # text before the course code
+        else:
+            problems.append("No course code found (not a class?)")
+ 
+        m = TITLE_RE.search(s)
+        if m:
+            out["Course_Title"] = m.group(1).strip()
+ 
+        m = MODE_RE.search(s)
+        if m and m.group(1):
+            out["Session_Mode"] = m.group(1).strip()
+ 
+        m = TIME_RANGE_RE.search(s)
+        if m:
+            t1, mer1, t2, mer2 = m.group(1), m.group(2) or m.group(4), m.group(3), m.group(4)
+            try:
+                start, end = to_time(t1, mer1), to_time(t2, mer2)
+                if start > end and not m.group(2):  # e.g. "11-1pm" read as 11pm-1pm
+                    start = to_time(t1, "am" if mer1.lower() == "pm" else "pm")
+                out["Class_Start"], out["Class_End"] = start, end
+                if end <= start:
+                    problems.append("Class end time is not after class start time")
+            except ValueError:
+                problems.append(f"Could not read class time '{m.group(0)}'")
+        else:
+            problems.append("No class time found in subject")
+    except Exception as e:  # never let one odd row stop the whole run
+        problems.append(f"Unexpected parse error: {e}")
+ 
+    if out["Course"] and not out["Instructor"]:
+        problems.append("No name found before course code")
+    if out["Course_Prefix"] and out["Course_Prefix"] not in DEPT_LOOKUP:
+        problems.append(f"Course prefix '{out['Course_Prefix']}' not in DEPT_LOOKUP")
+    return out, problems
+
+ 
+def is_true(value):
+    return value is True or str(value).strip().upper() == "TRUE"
+ 
+ 
+def check_schedule(row):
+    """Sanity-check the calendar slot and compare it with the class time from the subject."""
+    start, end = row["Start"], row["End"]
+    if pd.isna(start) or pd.isna(end):
+        return ["Start or end date missing/unreadable"]
+ 
+    problems = []
+    if end <= start:
+        problems.append("Calendar end is not after calendar start")
+    if start.date() != end.date():
+        problems.append("Event spans multiple days")
+    if is_true(row.get("AllDay")):
+        problems.append("All-day event")
+ 
+    cs, ce = row["Class_Start"], row["Class_End"]
+    if pd.notna(cs) and pd.notna(ce) and start.date() == end.date():
+        if cs < start.time():
+            problems.append("Class starts before the booked time")
+        if ce > end.time():
+            problems.append("Class ends after the booked time")
+    return problems
+ 
+ 
+def minutes_between(date_part, t_later, t_earlier):
+    if pd.isna(date_part) or pd.isna(t_later) or pd.isna(t_earlier):
+        return None
+    a = datetime.combine(date_part, t_later)
+    b = datetime.combine(date_part, t_earlier)
+    return (a - b).total_seconds() / 60
+ 
+ 
+def load_raw(path):
+    try:
+        raw = pd.read_excel(path)
+    except FileNotFoundError:
+        sys.exit(f"Can't find '{path}'. Run a pull script first, or update INPUT_FILE.")
+    except Exception as e:
+        sys.exit(f"Couldn't read '{path}': {e}")
+ 
+    if raw.empty:
+        sys.exit(f"'{path}' has no rows. Check the date range in the pull script.")
+    missing = [c for c in REQUIRED_INPUT_COLUMNS if c not in raw.columns]
+    if missing:
+        sys.exit(f"'{path}' is missing required column(s): {', '.join(missing)}. "
+                 f"Found: {', '.join(map(str, raw.columns))}")
+ 
+    for optional in ["Location", "Organizer", "Categories", "Body", "AllDay"]:
+        if optional not in raw.columns:  # some exports omit these
+            raw[optional] = ""
+    for col in ["Start", "End"]:  # format="mixed" copes with inconsistent date formats
+        raw[col] = pd.to_datetime(raw[col], format="mixed", errors="coerce")  # bad -> NaT, flagged later
+    return raw
+ 
+ 
+def write_workbook(path, sheets, flagged_sheet="Tracker"):
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        for name, frame in sheets.items():
+            frame.to_excel(writer, sheet_name=name, index=False)
+            ws = writer.sheets[name]
+            ws.freeze_panes = "A2"
+            for col in ws.columns:  # rough auto-width, capped
+                width = max(len(str(c.value)) if c.value is not None else 0 for c in col[:200])
+                ws.column_dimensions[col[0].column_letter].width = min(max(width + 2, 10), 50)
+ 
+        # Highlight flagged rows in the Tracker sheet
+        ws = writer.sheets[flagged_sheet]
+        flag_col = list(sheets[flagged_sheet].columns).index("Review Flag") + 1
+        fill = PatternFill("solid", fgColor="FFF2CC")
+        for r in range(2, ws.max_row + 1):
+            if ws.cell(r, flag_col).value == "Review":
+                for c in range(1, ws.max_column + 1):
+                    ws.cell(r, c).fill = fill
+ 
+ 
+def main():
+    raw = load_raw(INPUT_FILE)
+ 
+    # Parse every row; collect problems per row instead of stopping on the first one
+    parsed_rows, problem_lists = [], []
+    for subject in raw["Subject"]:
+        fields, problems = parse_subject(subject)
+        parsed_rows.append(fields)
+        problem_lists.append(problems)
+    df = pd.concat([raw, pd.DataFrame(parsed_rows, index=raw.index)], axis=1)
+ 
+    df["Date"] = df["Start"].dt.date
+    df["Weekday"] = df["Start"].dt.strftime("%a")
+    df["Scheduled_Start"] = df["Start"].dt.time
+    df["Scheduled_End"] = df["End"].dt.time
+    df["Notes"] = df["Body"].fillna("").astype(str).str.strip()
+ 
+    # Booked time vs. actual class time (e.g. 12:00 booked, class at 12:40 = 40 min setup)
+    df["Setup_Minutes"] = [minutes_between(d, cs, ss) for d, cs, ss
+                           in zip(df["Date"], df["Class_Start"], df["Scheduled_Start"])]
+    df["Class_Minutes"] = [minutes_between(d, ce, cs) for d, ce, cs
+                           in zip(df["Date"], df["Class_End"], df["Class_Start"])]
+ 
+    # Combine subject problems with calendar-slot problems
+    for i, (idx, row) in enumerate(df.iterrows()):
+        try:
+            problem_lists[i] += check_schedule(row)
+        except Exception as e:
+            problem_lists[i].append(f"Unexpected schedule check error: {e}")
+    df["Review Reason"] = ["; ".join(p) for p in problem_lists]
+    df["Review Flag"] = df["Review Reason"].map(lambda r: "Review" if r else "OK")
+ 
+    # Remove exact duplicates, but keep a record of what was removed
+    dup_mask = df.duplicated(subset=["Subject", "Start"], keep="first")
+    duplicates = df[dup_mask]
+    df = df[~dup_mask].sort_values("Start")
+ 
+    cols = ["Date", "Weekday", "Scheduled_Start", "Scheduled_End", "Class_Start", "Class_End",
+            "Setup_Minutes", "Class_Minutes", "Instructor", "Dept", "Course_Number", "Course",
+            "Course_Title", "Session_Mode", "Notes", "Location", "Organizer", "Categories",
+            "Review Flag", "Review Reason", "Subject"]
+    clean = df[cols]
+ 
+    # Sheet laid out with the same headings as your tracking spreadsheet
+    event_name = (clean["Course"].fillna("") + " " + clean["Course_Title"].fillna("")).str.strip()
+    tracker = pd.DataFrame({
+        "Date": clean["Date"],
+        "Requestor Email/Name": clean["Instructor"].fillna(clean["Organizer"]),
+        "Class/Event Name": event_name.where(event_name != "", clean["Subject"]),
+        "College/Dept": clean["Dept"].map(DEPT_LOOKUP),
+        "College/Department Codes": clean["Dept"],
+        "Notes": clean["Notes"],
+        "Review Flag": clean["Review Flag"],
+        "Review Reason": clean["Review Reason"],
+    })
+ 
+    sheets = {"Tracker": tracker, "Clean": clean, "Raw": raw}
+    if len(duplicates):
+        sheets["Duplicates"] = duplicates[["Subject", "Start", "End", "Organizer"]]
+ 
+    try:
+        write_workbook(OUTPUT_FILE, sheets)
+        saved_to = OUTPUT_FILE
+    except PermissionError:  # usually: the file is open in Excel
+        saved_to = OUTPUT_FILE.replace(".xlsx", f"_{datetime.now():%Y%m%d_%H%M%S}.xlsx")
+        print(f"'{OUTPUT_FILE}' is locked (open in Excel?). Saving to '{saved_to}' instead.")
+        write_workbook(saved_to, sheets)
+ 
+    # Summary
+    flagged = (clean["Review Flag"] == "Review").sum()
+    print(f"\n{len(raw)} rows read, {len(clean)} kept, {len(duplicates)} duplicate(s) removed")
+    print(f"{flagged} row(s) flagged for review")
+    reasons = Counter(r.strip() for text in clean["Review Reason"] if text for r in text.split(";"))
+    for reason, count in reasons.most_common():
+        print(f"  {count:>3} x {reason}")
+    print(f"Saved to {saved_to}")
+ 
+ 
+if __name__ == "__main__":
+    main()
+ 
