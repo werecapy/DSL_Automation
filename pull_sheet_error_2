@@ -29,14 +29,14 @@ OUTPUT_FILE = "calendar_clean.xlsx"
 # The prefix and the college/department code can differ, so each prefix is mapped explicitly.
 # Prefixes missing from this table are flagged and their College columns left blank.
 DEPT_LOOKUP = {
-    "LIB": "Library",  # example only: replace with your real names
-    "UE": "Undergraduate Education",
-    "CAL": "College of Arts and Letters",
-    "x":"Public Events",
-    "CANR":"College of Agriculture & Natural Rescource",
-    "SocS": "College of Socical Science"
-    "BUS":"Buisness/Entrepenuership(? not sure whether to include both)"
-    "ESHP":"Entrepreneurship"
+    "LIB": ("Library"),  # example only: replace with your real names
+    "UE": ("Undergraduate Education"),
+    "CAL": ("College of Arts and Letters"),
+    "x":("Public Events"),
+    "CANR":("College of Agriculture & Natural Rescource"),
+    "SocS": ("College of Socical Science"),
+    "BUS":("Buisness", "Entrepenuership? not sure whether to include both"),
+    "ESHP":("Entrepreneurship")
 }
  
 REQUIRED_INPUT_COLUMNS = ["Subject", "Start", "End"]
